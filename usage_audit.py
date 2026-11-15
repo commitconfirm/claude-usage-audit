@@ -25,7 +25,7 @@ import subprocess
 import sys
 import zlib
 
-VERSION = "0.3.0"
+VERSION = "0.5.0"
 
 # USD per million tokens, list price. Longest matching model-id prefix wins.
 # Source: https://platform.claude.com/docs/en/about-claude/pricing (2026-11-15).
@@ -105,6 +105,10 @@ def fmt_usd(x):
 
 def pct(a, b):
     return "0%" if not b else "%d%%" % round(100.0 * a / b)
+
+
+def fmt_when(t):
+    return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
 def fmt_dur(s):
@@ -559,7 +563,7 @@ def analyze(st, prices, since, until, threshold, label):
                          "median_gap": statistics.median(gaps), "cost": sum(t["cost"] for t in ts_),
                          "mean_ctx": int(statistics.mean(t["max_ctx"] for t in ts_))})
     out["repeated_prompts"] = sorted(repeated, key=lambda x: -x["cost"])
-    out["top_turns"] = [{"session": sessions[t["sid"]]["title"], "origin": t["origin"],
+    out["top_turns"] = [{"session": sessions[t["sid"]]["title"], "when": fmt_when(t["ts"]), "origin": t["origin"],
                          "command": t["cmd"] or "-", "prompt_chars": t["chars"], "requests": t["requests"],
                          "max_ctx": t["max_ctx"], "cost": t["cost"]}
                         for t in sorted(turns, key=lambda t: -t["cost"])[:15]]
@@ -570,6 +574,7 @@ def analyze(st, prices, since, until, threshold, label):
         threads[(r["sid"], r["agent"])].append(r)
     miss = {"count": 0, "tokens": 0, "cost": 0.0, "by_gap": collections.defaultdict(lambda: [0, 0.0])}
     rebuild = {"count": 0, "tokens": 0, "cost": 0.0}
+    miss_events = []
     starts_sub = []
     for (sid, agent), rs in threads.items():
         prev = None
@@ -592,16 +597,24 @@ def analyze(st, prices, since, until, threshold, label):
                     miss["cost"] += wcost
                     miss["by_gap"][g][0] += 1
                     miss["by_gap"][g][1] += wcost
+                    miss_events.append({"session": sessions[sid]["title"], "when": fmt_when(r["ts"]), "idle": gap,
+                                        "thread": "subagent" if agent else "main", "model": r["model"],
+                                        "tokens": wtok, "cost": wcost})
             prev = r
     miss["by_gap"] = dict(miss["by_gap"])
     out["cache_misses"], out["cache_rebuilds"] = miss, rebuild
+    out["cold_resumes"] = sorted(miss_events, key=lambda e: -e["cost"])[:12]
 
     # ---- subagents
     sub = collections.defaultdict(lambda: {"threads": 0, "requests": 0, "cost": 0.0, "max_ctx": 0, "start_ctx": []})
+    thread_events = []
     for (sid, agent), rs in threads.items():
         if not agent:
             continue
         typ = rs[0]["attr_agent"] or st.agent_meta.get(agent) or "unknown"
+        thread_events.append({"session": sessions[sid]["title"], "when": fmt_when(rs[0]["ts"]), "type": typ,
+                              "model": rs[0]["model"], "requests": len(rs), "max_ctx": max(r["ctx"] for r in rs),
+                              "cost": sum(r["usd"] for r in rs)})
         s = sub[(typ, rs[0]["model"])]
         s["threads"] += 1
         s["requests"] += len(rs)
@@ -612,6 +625,7 @@ def analyze(st, prices, since, until, threshold, label):
                          "cost": v["cost"], "cost_per_thread": v["cost"] / v["threads"],
                          "median_start_ctx": int(statistics.median(v["start_ctx"])), "max_ctx": v["max_ctx"]}
                         for k, v in sorted(sub.items(), key=lambda kv: -kv[1]["cost"])]
+    out["subagent_threads"] = sorted(thread_events, key=lambda e: -e["cost"])[:12]
     agent_calls = collections.Counter(tuple(v) for tid, v in st.agent_launch.items()
                                       if st.tool_owner.get(tid, (None, None))[1] in live)
     out["agent_calls"] = [{"type": k[0], "model_arg": k[1], "calls": v} for k, v in agent_calls.most_common()]
@@ -754,6 +768,9 @@ def analyze(st, prices, since, until, threshold, label):
         % (fmt_usd(total["c_read"]), P(total["c_read"] / T), fmt_usd(total["c_output"]), P(total["c_output"] / T)),
         "The costliest session (%s) ran at a median context of %s across %d requests."
         % (top["title"], fmt_tok(top["median_ctx"]), top["requests"]),
+        "Costliest single prompt: %s at %s, %d requests at up to %s of context: %s."
+        % (out["top_turns"][0]["session"], out["top_turns"][0]["when"], out["top_turns"][0]["requests"],
+           fmt_tok(out["top_turns"][0]["max_ctx"]), fmt_usd(out["top_turns"][0]["cost"])) if out["top_turns"] else None,
     ], [
         "Start a new session for each task and carry a short handoff note across.",
         "Compact at task boundaries, before the context passes %s." % fmt_tok(threshold),
@@ -768,6 +785,9 @@ def analyze(st, prices, since, until, threshold, label):
         "%d followed an idle gap of over 1 hour (%s)." % (gaps["over 1h"][0], fmt_usd(gaps["over 1h"][1])) if "over 1h" in gaps else None,
         "%d followed a gap of 5 minutes to 1 hour (%s)." % (gaps["5m-1h"][0], fmt_usd(gaps["5m-1h"][1])) if "5m-1h" in gaps else None,
         "%s of cache writes used the 5-minute lifetime, so a six-minute pause re-bills the whole context." % P(five) if five >= 0.2 else None,
+        "Worst single case: %s at %s, resumed after %s idle, %s re-written: %s."
+        % (out["cold_resumes"][0]["session"], out["cold_resumes"][0]["when"], fmt_dur(out["cold_resumes"][0]["idle"]),
+           fmt_tok(out["cold_resumes"][0]["tokens"]), fmt_usd(out["cold_resumes"][0]["cost"])) if out["cold_resumes"] else None,
     ], [
         "Before stepping away from a large session, compact it or close it with a handoff note.",
         "Pick old work back up in a new session from the handoff note.",
@@ -800,6 +820,10 @@ def analyze(st, prices, since, until, threshold, label):
         if common in per and max(per.values()) / per[common] >= 2 else None,
         "%d of %d launches asked for a larger model or inherited the session's model." % (pricey, launches) if launches and pricey else None,
         "The largest thread reached %s of context." % fmt_tok(max(v[2] for v in by_m.values())) if by_m else None,
+        "Costliest single thread: %s on %s in %s at %s, %d requests, context up to %s: %s."
+        % (out["subagent_threads"][0]["type"], out["subagent_threads"][0]["model"], out["subagent_threads"][0]["session"],
+           out["subagent_threads"][0]["when"], out["subagent_threads"][0]["requests"],
+           fmt_tok(out["subagent_threads"][0]["max_ctx"]), fmt_usd(out["subagent_threads"][0]["cost"])) if out["subagent_threads"] else None,
     ], [
         "Name a cheaper model on each subagent launch unless the task needs the larger one.",
         "Give each subagent one narrow task, so its context stays small.",
@@ -810,6 +834,9 @@ def analyze(st, prices, since, until, threshold, label):
         "%s of cost came from %d turns you did not start (%s)."
         % (P(s_auto), len(auto), ", ".join(sorted({t["origin"] for t in auto}))) if auto else None,
         "Those turns ran at a mean context of %s." % fmt_tok(statistics.mean(t["max_ctx"] for t in auto)) if auto else None,
+        "Costliest single wake-up: %s at %s, %d requests at up to %s of context: %s."
+        % ((lambda w: (sessions[w["sid"]]["title"], fmt_when(w["ts"]), w["requests"], fmt_tok(w["max_ctx"]), fmt_usd(w["cost"])))
+           (max(auto, key=lambda t: t["cost"]))) if auto else None,
     ], [
         "Have background tasks report once when all are finished, not one wake-up per task.",
         "Run loops and long background jobs from a dedicated small session.",
@@ -888,7 +915,7 @@ def bucket_rows(d, total_cost, limit=12):
     return rows
 
 
-def findings_md(a, notes):
+def findings_md(a, notes, notes_title="Analyst notes"):
     L = ["## What to change", "",
          "Ranked by the share of estimated cost each pattern touches. Shares overlap, and a share is the cost involved, not the saving.", ""]
     if not a["findings"]:
@@ -900,11 +927,11 @@ def findings_md(a, notes):
     if a["minor"]:
         L += ["Checked and found small: " + "; ".join("%s (%d%%)" % (t[0].lower() + t[1:], round(100 * v)) for t, v in a["minor"]) + ".", ""]
     if notes:
-        L += ["## Analyst notes", "", notes.strip(), ""]
+        L += ["## " + notes_title, "", notes.strip(), ""]
     return L
 
 
-def render(a, threshold, notes=None, with_findings=True):
+def render(a, threshold, notes=None, with_findings=True, notes_title="Analyst notes"):
     if not a["requests"]:
         return ("# Claude usage audit\n\nNo priced requests found in the selected logs and date range.\n\n"
                 + (table(("Remote source", "Result"), a["remote"]) if a.get("remote") else ""))
@@ -917,7 +944,7 @@ def render(a, threshold, notes=None, with_findings=True):
          "Costs are estimates from logged token counts. Covered: this machine%s."
          % ("".join(", " + h for h, res in a["remote"] if not res.startswith("failed")) if a["remote"] else " only"), ""]
     if with_findings:
-        L += findings_md(a, notes)
+        L += findings_md(a, notes, notes_title)
     L += ["## Where the money went", "",
           table(("Component", "Tokens", "Est. cost", "Share"), [
               ("Cache read (re-reading context)", fmt_tok(a["total"]["cr"]), fmt_usd(a["total"]["c_read"]), pct(a["total"]["c_read"], T)),
@@ -957,18 +984,26 @@ def render(a, threshold, notes=None, with_findings=True):
           table(("Command", "Turns", "Est. cost", "Share"),
                 [(k, v["turns"], fmt_usd(v["cost"]), pct(v["cost"], T)) for k, v in list(a["by_command"].items())[:15]])]
     L += ["### Costliest single turns", "",
-          table(("Session", "Origin", "Command", "Prompt chars", "Requests", "Max ctx", "Est. cost"),
-                [(t["session"], t["origin"], t["command"], t["prompt_chars"], t["requests"], fmt_tok(t["max_ctx"]), fmt_usd(t["cost"]))
+          table(("Session", "When (UTC)", "Origin", "Command", "Prompt chars", "Requests", "Max ctx", "Est. cost"),
+                [(t["session"], t["when"], t["origin"], t["command"], t["prompt_chars"], t["requests"], fmt_tok(t["max_ctx"]), fmt_usd(t["cost"]))
                  for t in a["top_turns"]])]
     m, rb = a["cache_misses"], a["cache_rebuilds"]
     L += ["## Cache misses", "",
           "%d requests re-wrote context that should have been cached: %s tokens, %s. A further %d rebuilds followed a context drop (compaction), costing %s."
           % (m["count"], fmt_tok(m["tokens"]), fmt_usd(m["cost"]), rb["count"], fmt_usd(rb["cost"])), "",
-          table(("Idle gap before the miss", "Misses", "Est. cost"), [(k, v[0], fmt_usd(v[1])) for k, v in sorted(m["by_gap"].items())])]
+          table(("Idle gap before the miss", "Misses", "Est. cost"), [(k, v[0], fmt_usd(v[1])) for k, v in sorted(m["by_gap"].items())]),
+          "### Costliest cold resumes", "", "Each row is one request that paid to rebuild a context left idle.", "",
+          table(("Session", "When (UTC)", "Thread", "Model", "Idle before", "Tokens re-written", "Est. cost"),
+                [(e["session"], e["when"], e["thread"], e["model"], fmt_dur(e["idle"]), fmt_tok(e["tokens"]), fmt_usd(e["cost"]))
+                 for e in a["cold_resumes"]])]
     L += ["## Subagents", "",
           table(("Type", "Model", "Threads", "Requests", "Est. cost", "Per thread", "Median start ctx", "Max ctx"),
                 [(s["type"], s["model"], s["threads"], s["requests"], fmt_usd(s["cost"]), fmt_usd(s["cost_per_thread"]),
                   fmt_tok(s["median_start_ctx"]), fmt_tok(s["max_ctx"])) for s in a["subagents"][:15]]),
+          "### Costliest subagent threads", "",
+          table(("Session", "Started (UTC)", "Type", "Model", "Requests", "Max ctx", "Est. cost"),
+                [(e["session"], e["when"], e["type"], e["model"], e["requests"], fmt_tok(e["max_ctx"]), fmt_usd(e["cost"]))
+                 for e in a["subagent_threads"]]),
           "Model argument on each subagent launch (`inherit` means the session's own model was used):", "",
           table(("Type", "Model argument", "Launches"), [(c["type"], c["model_arg"], c["calls"]) for c in a["agent_calls"][:12]])]
     L += ["## Skills and MCP servers", "", "As attributed by Claude Code on each request.", "",
@@ -1045,7 +1080,7 @@ td:first-child{min-width:170px} tr:last-child td{border-bottom:0} td.num,th.num{
 .track{width:88px;height:8px;background:var(--line);border-radius:0 4px 4px 0;overflow:hidden;display:inline-block}
 .fill{display:block;height:100%;background:var(--accent);border-radius:0 4px 4px 0}
 """
-NUM_RE = re.compile(r"^(-|n/a|\d{4}-\d{2}-\d{2}|\$?[\d.,]+[kMBhms%]?( \(\$[\d.,]+\))?)$")
+NUM_RE = re.compile(r"^(-|n/a|\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?|\$?[\d.,]+[kMBhms%]?( \(\$[\d.,]+\))?)$")
 
 
 def inline_md(t):
@@ -1102,7 +1137,7 @@ def md_to_html(md):
     return "\n".join(out)
 
 
-def render_html(a, threshold, notes=None):
+def render_html(a, threshold, notes=None, notes_title="Analyst notes"):
     """One self-contained page: no scripts, no network requests, light and dark themes."""
     esc = lambda t: html.escape(str(t), quote=True)
     md = render(a, threshold, with_findings=False)
@@ -1136,7 +1171,7 @@ def render_html(a, threshold, notes=None):
             parts.append("<p class=\"muted\">Checked and found small: %s.</p>" % esc("; ".join(
                 "%s (%d%%)" % (t[0].lower() + t[1:], round(100 * v)) for t, v in a["minor"])))
         if notes:
-            parts.append("<h2>Analyst notes</h2>" + md_to_html(notes.strip()))
+            parts.append("<h2>%s</h2>" % esc(notes_title) + md_to_html(notes.strip()))
         cut = md.find("## Where the money went")
         parts.append(md_to_html(md[cut:] if cut >= 0 else ""))
     else:
@@ -1278,7 +1313,8 @@ def main(argv=None):
     ap.add_argument("--dump-prices", action="store_true", help="print the built-in price table as JSON and exit")
     ap.add_argument("--md", help="write the Markdown report to this file (default: stdout)")
     ap.add_argument("--html", help="write a self-contained HTML report to this file")
-    ap.add_argument("--notes", help="Markdown file with written analysis to include under 'Analyst notes'")
+    ap.add_argument("--notes", help="Markdown file with written analysis to include in the report")
+    ap.add_argument("--notes-title", default="Analyst notes", help="heading for the --notes section (default: Analyst notes)")
     ap.add_argument("--json", help="also write the full results as JSON to this file")
     ap.add_argument("--redact", action="store_true", help="replace session, project, file and MCP names with hashes")
     ap.add_argument("--context-threshold", type=int, default=150000, help="context size treated as large (default 150000)")
@@ -1343,9 +1379,9 @@ def main(argv=None):
             notes = fh.read()
     if args.html:
         with open(args.html, "w") as fh:
-            fh.write(render_html(a, args.context_threshold, notes))
+            fh.write(render_html(a, args.context_threshold, notes, args.notes_title))
         print("HTML report written to %s" % args.html, file=sys.stderr)
-    report = render(a, args.context_threshold, notes)
+    report = render(a, args.context_threshold, notes, notes_title=args.notes_title)
     if args.md:
         with open(args.md, "w") as fh:
             fh.write(report)
