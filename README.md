@@ -54,7 +54,7 @@ For a host your laptop cannot reach, run `python3 usage_audit.py --export host-a
 
 ## What the report shows
 
-- **What to change:** each costly pattern the numbers point at, ranked by the share of cost it touches, with its evidence and the habit that addresses it. Patterns that were checked and found small are listed too.
+- **What to change:** each costly pattern the numbers point at, ranked by the share of cost it touches, with its evidence, its single worst instance (session, time, cost), and the habit that addresses it. Patterns that were checked and found small are listed too.
 - **Where the money went:** cache reads, cache writes, output, input.
 - **Cost drivers**, as overlapping shares: large-context requests, subagents, long sessions, parallel sessions, turns you did not start, cache misses, repeated tool arguments.
 - **Breakdowns** by model (main thread versus subagent), context size, effort level, day, project, and surface.
@@ -90,7 +90,9 @@ Prompt text, response text, and document contents stay in the logs. The report c
 git clone https://github.com/commitconfirm/claude-usage-audit ~/.claude/skills/usage-audit
 ```
 
-Then run `/usage-audit` in Claude Code. Claude runs the script, writes the analysis of which habits to change, and builds the final HTML report with that analysis included. The skill is user-invoked only, so it adds nothing to your context until you call it.
+Then run `/usage-audit` in Claude Code. The skill is a blunt tutor. It runs the script, names your most expensive mistakes with their dates and dollar figures, and teaches three lessons, one at a time: what went wrong, why it cost that, what to do instead, a drill, and a check question. It builds the final HTML report with the lessons included and keeps a progress log, so the next run starts with what changed.
+
+`LESSONS.md` holds the teaching material. The skill is user-invoked only, so it adds nothing to your context until you call it.
 
 ## Tests
 
