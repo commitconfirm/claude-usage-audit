@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+# never commit logs, exports, reports, or notes
+*.jsonl
+*.json
+*.html
+report*
+audit*
+notes*
+claude-usage-audit-*
